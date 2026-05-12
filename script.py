@@ -1,3 +1,21 @@
+"""
+veracode_audit.py
+
+For each org's veracode repo, pull the last N "Static Code Analysis - {repo}"
+runs. Find the policy_scan job. If the job failed AND produced zero findings
+(meaning the scan itself broke, not a policy violation), download the
+policy_scan log, parse it for actionable errors, and save it.
+
+Output:
+  - CSV with one row per broken run (error types, messages, run URL)
+  - JSON with the same data
+  - Full log files saved per broken run
+
+Usage:
+  python veracode_audit.py --enterprise <slug> --limit 10
+  python veracode_audit.py --orgs-file orgs.txt --max-runs 20
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +28,7 @@ import sys
 import threading
 import time
 import zipfile
+from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +48,23 @@ SAST_PREFIX = "Static Code Analysis - "
 # The step uses veracode/uploadandscan-action and then
 # veracode/github-actions-integration-helper to post results.
 POLICY_JOB_NEEDLE = "policy_scan"
+
+# Workflow files where teams: is injected by the rollout script
+WORKFLOW_FILES = (
+    ".github/workflows/veracode-policy-scan.yml",
+    ".github/workflows/veracode-sandbox-scan.yml",
+)
+
+# Match teams: value under uploadandscan-action with: block. Same pattern the
+# rollout script uses to find and update the value.
+_TEAMS_BLOCK_RE = re.compile(
+    r"[ \t]*(?:-[ \t]+)?uses:[ \t]+veracode/(?:veracode-)?uploadandscan-action@[^\n]+\n"
+    r"(?:[ \t]+[^\n]+\n)*?"
+    r"[ \t]+with:\n"
+    r"((?:[ \t]+[^\n]+\n)+)",
+    re.MULTILINE,
+)
+_TEAMS_VALUE_RE = re.compile(r'^\s+teams\s*:\s*["\']?([^"\'\n]*)["\']?\s*$', re.MULTILINE)
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -210,6 +246,85 @@ def fetch_sast_runs(api_base: str, org: str, token: str, max_runs: int) -> list[
         if len(runs) < 100:
             break
     return matched
+
+
+# ---------------------------------------------------------------------------
+# Check teams: value in workflow files
+# ---------------------------------------------------------------------------
+
+def _extract_teams_value(content: str) -> str | None:
+    """Find the teams: value under the uploadandscan-action with: block.
+
+    Returns None if no teams line is present.
+    """
+    block_match = _TEAMS_BLOCK_RE.search(content)
+    if not block_match:
+        return None
+    block = block_match.group(1)
+    value_match = _TEAMS_VALUE_RE.search(block)
+    if not value_match:
+        return None
+    return value_match.group(1).strip()
+
+
+def check_workflow_teams(api_base: str, org: str, token: str) -> dict[str, Any]:
+    """Check the teams: parameter in both workflow files for an org.
+
+    Returns a dict per workflow file with:
+      - present: bool (file exists)
+      - teams_set: bool (teams: line found under uploadandscan-action)
+      - teams_value: str (the actual value, empty string if blank)
+      - uses_uploadandscan: bool (the action block was found)
+    """
+    result: dict[str, Any] = {}
+
+    for workflow_path in WORKFLOW_FILES:
+        key = workflow_path.split("/")[-1]  # veracode-policy-scan.yml etc.
+        url = f"{api_base}/repos/{org}/{VERACODE_REPO}/contents/{workflow_path}"
+        r = gh_get(url, token)
+
+        if r.status_code == 404:
+            result[key] = {
+                "present": False,
+                "teams_set": False,
+                "teams_value": "",
+                "uses_uploadandscan": False,
+            }
+            continue
+        if r.status_code != 200:
+            result[key] = {
+                "present": False,
+                "teams_set": False,
+                "teams_value": "",
+                "uses_uploadandscan": False,
+                "error": f"http_{r.status_code}",
+            }
+            continue
+
+        try:
+            content_b64 = r.json().get("content", "")
+            content = b64decode(content_b64).decode("utf-8", errors="replace")
+        except Exception:
+            result[key] = {
+                "present": True,
+                "teams_set": False,
+                "teams_value": "",
+                "uses_uploadandscan": False,
+                "error": "decode_failed",
+            }
+            continue
+
+        block_match = _TEAMS_BLOCK_RE.search(content)
+        teams_value = _extract_teams_value(content) if block_match else None
+
+        result[key] = {
+            "present": True,
+            "uses_uploadandscan": bool(block_match),
+            "teams_set": teams_value is not None,
+            "teams_value": teams_value or "",
+        }
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -456,20 +571,32 @@ def parse_policy_scan_log(log_text: str) -> dict[str, Any]:
 
 def audit_org(
     api_base: str, org: str, token: str, max_runs: int, logs_dir: Path,
-) -> list[dict[str, Any]]:
-    """Audit one org. Returns list of broken policy_scan run dicts.
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Audit one org. Returns (broken_runs, teams_check).
 
-    API calls per run:
-      1. get jobs          (skip if policy_scan not found / success / skipped)
-      2. download log zip  (only if policy_scan failed)
-      3. parse log locally (skip if findings_count > 0)
+    API calls per org:
+      1. check_workflow_teams         -> 2 calls (one per workflow file)
+      2. fetch_sast_runs              -> 1-5 calls (list runs)
+      3. per failed run: get_policy_scan_job + download log
+
+    teams_check is a dict per workflow file with the current teams: value
+    or {"present": False} if the file is missing.
     """
     results: list[dict[str, Any]] = []
+
+    # Check teams: in both workflow files (2 API calls)
+    teams_check = check_workflow_teams(api_base, org, token)
+    pol = teams_check.get("veracode-policy-scan.yml", {})
+    sb = teams_check.get("veracode-sandbox-scan.yml", {})
+    _tprint(
+        f"  [{org}] teams: policy={pol.get('teams_value') or '(missing)'}, "
+        f"sandbox={sb.get('teams_value') or '(missing)'}"
+    )
 
     runs = fetch_sast_runs(api_base, org, token, max_runs)
     if not runs:
         _tprint(f"  [{org}] No SAST runs")
-        return results
+        return results, teams_check
 
     _tprint(f"  [{org}] {len(runs)} SAST runs")
 
@@ -533,7 +660,7 @@ def audit_org(
         _tprint(f"  [{org}] {target_repo}: {label} - {msg}")
         results.append(entry)
 
-    return results
+    return results, teams_check
 
 
 # ---------------------------------------------------------------------------
@@ -599,16 +726,19 @@ def main() -> None:
     # so a crash or KeyboardInterrupt doesn't lose all progress.
     jsonl_path = outdir / f"policy_scan_audit_{ts}.jsonl"
     jsonl_lock = threading.Lock()
+    teams_lock = threading.Lock()
     all_results: list[dict[str, Any]] = []
+    teams_audit: dict[str, dict[str, Any]] = {}  # org -> teams_check dict
 
     def process_org(idx: int, org: str) -> list[dict[str, Any]]:
         _tprint(f"[{idx}/{len(orgs)}] {org}")
         try:
-            results = audit_org(api_base, org, token, args.max_runs, logs_dir)
+            results, teams_check = audit_org(api_base, org, token, args.max_runs, logs_dir)
         except Exception as exc:
             _tprint(f"  [{org}] ERROR: {exc}")
             return []
-        # Write incrementally
+        with teams_lock:
+            teams_audit[org] = teams_check
         if results:
             with jsonl_lock:
                 with jsonl_path.open("a", encoding="utf-8") as f:
@@ -628,7 +758,7 @@ def main() -> None:
         for i, org in enumerate(orgs, 1):
             all_results.extend(process_org(i, org))
 
-    # Write CSV
+    # Write CSV (broken policy_scan runs)
     csv_path = outdir / f"policy_scan_audit_{ts}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, quoting=csv.QUOTE_ALL)
@@ -636,10 +766,29 @@ def main() -> None:
         for entry in all_results:
             w.writerow([entry.get(col, "") for col in CSV_HEADER])
 
-    # Write JSON
+    # Write JSON (broken policy_scan runs)
     json_path = outdir / f"policy_scan_audit_{ts}.json"
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
+
+    # Write teams audit CSV (one row per org)
+    teams_csv = outdir / f"teams_audit_{ts}.csv"
+    with teams_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow([
+            "org",
+            "policy_scan_present", "policy_scan_teams_set", "policy_scan_teams_value",
+            "sandbox_scan_present", "sandbox_scan_teams_set", "sandbox_scan_teams_value",
+        ])
+        for org_name in sorted(teams_audit):
+            tc = teams_audit[org_name]
+            pol = tc.get("veracode-policy-scan.yml", {})
+            sb = tc.get("veracode-sandbox-scan.yml", {})
+            w.writerow([
+                org_name,
+                pol.get("present", False), pol.get("teams_set", False), pol.get("teams_value", ""),
+                sb.get("present", False), sb.get("teams_set", False), sb.get("teams_value", ""),
+            ])
 
     # Summary
     total = len(all_results)
@@ -650,16 +799,41 @@ def main() -> None:
                 by_type[t] = by_type.get(t, 0) + 1
 
     print(f"\n{'=' * 50}")
+    print(f"Orgs audited            : {len(teams_audit)}")
     print(f"Broken policy_scan runs : {total}")
     print(f"Logs saved              : {sum(1 for e in all_results if e.get('log_file'))}")
     if by_type:
         print("By error type:")
         for t, c in sorted(by_type.items(), key=lambda x: x[1], reverse=True):
             print(f"  {t}: {c}")
+
+    # Teams audit summary
+    pol_set = sb_set = pol_missing = sb_missing = pol_blank = sb_blank = 0
+    for tc in teams_audit.values():
+        pol = tc.get("veracode-policy-scan.yml", {})
+        sb = tc.get("veracode-sandbox-scan.yml", {})
+        if not pol.get("present"):
+            pol_missing += 1
+        elif not pol.get("teams_set"):
+            pol_blank += 1
+        else:
+            pol_set += 1
+        if not sb.get("present"):
+            sb_missing += 1
+        elif not sb.get("teams_set"):
+            sb_blank += 1
+        else:
+            sb_set += 1
+    print()
+    print("Teams audit (workflow files):")
+    print(f"  policy-scan.yml  : {pol_set} have teams, {pol_blank} missing teams line, {pol_missing} file missing")
+    print(f"  sandbox-scan.yml : {sb_set} have teams, {sb_blank} missing teams line, {sb_missing} file missing")
+
     print(f"{'=' * 50}")
-    print(f"\nCSV:  {csv_path}")
-    print(f"JSON: {json_path}")
-    print(f"Logs: {logs_dir}")
+    print(f"\nCSV:        {csv_path}")
+    print(f"JSON:       {json_path}")
+    print(f"Teams CSV:  {teams_csv}")
+    print(f"Logs:       {logs_dir}")
 
 
 if __name__ == "__main__":
